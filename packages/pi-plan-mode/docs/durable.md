@@ -6,7 +6,7 @@
 
 ## Compatibility and release evidence
 
-The supported runtime is `@earendil-works/pi-durable` 1.2.0 with `@earendil-works/chord` 1.2.0. These are the repository's pinned, published dependencies, not the newer local Pi checkout. Other releases are unverified. The durable import graph has no coding-agent, TUI, Kit, settings-file, or session-decoding dependency. The existing `pi.extensions` entry and source/dist import paths remain available.
+The supported runtime is `@earendil-works/pi-durable` 1.2.0 with `@earendil-works/chord` 1.2.0. These are the repository's pinned, published dependencies, not the newer local Pi checkout. Other releases are unverified. The durable import graph has no coding-agent, TUI, Kit, settings-file, or session-decoding dependency. The existing `pi.extensions` entry, explicit and extensionless source/dist imports, and `package`/`package.json` metadata aliases remain available.
 
 The release-contract fixtures use a real Harness with synthetic providers and no paid calls:
 

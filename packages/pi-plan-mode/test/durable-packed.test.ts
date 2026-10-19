@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { build } from "esbuild";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
 const exec = promisify(execFile);
@@ -11,12 +12,14 @@ let manifest: {
   main?: string;
   types?: string;
   pi: { extensions: string[] };
-  exports: Record<string, string | { types: string; import: string }>;
+  exports: Record<string, string | { types: string; import?: string; default?: string }>;
   peerDependencies: Record<string, string>;
   peerDependenciesMeta: Record<string, { optional: boolean }>;
 };
 let packedFiles: string[];
 let consumerCompiled = false;
+let legacyCompiled = false;
+let legacyBundled = false;
 const children: ChildProcess[] = [];
 const consumers: Array<{
   child: ChildProcess;
@@ -212,6 +215,110 @@ console.log("packed coding consumer passed");
     "@earendil-works/pi-durable",
     "@earendil-works/chord",
   ]);
+
+  const legacyRoot = join(directory, "legacy");
+  await installPacked(legacyRoot, tarball, []);
+  const legacyImports = `
+import { isSafeCommand as extensionless } from "@narumitw/pi-plan-mode/src/tool-policy";
+import { isSafeCommand as explicitTs } from "@narumitw/pi-plan-mode/src/tool-policy.ts";
+import { isSafeCommand as explicitJs } from "@narumitw/pi-plan-mode/src/tool-policy.js";
+import sourceDirectory from "@narumitw/pi-plan-mode/src";
+import sourceIndex from "@narumitw/pi-plan-mode/src/index";
+import generatedDirectory from "@narumitw/pi-plan-mode/dist";
+import generatedIndex from "@narumitw/pi-plan-mode/dist/index";
+import { createDurablePlanMode } from "@narumitw/pi-plan-mode/dist/durable";
+import type { DurablePlanState } from "@narumitw/pi-plan-mode/dist/durable-types";
+export const phase: DurablePlanState["phase"] = "inactive";
+export const commands = [extensionless("pwd"), explicitTs("pwd"), explicitJs("pwd")];
+export const entries = [sourceDirectory, sourceIndex, generatedDirectory, generatedIndex, createDurablePlanMode];
+`;
+  await writeFile(join(legacyRoot, "legacy.ts"), legacyImports);
+  await writeFile(
+    join(legacyRoot, "tsconfig.json"),
+    JSON.stringify({
+      compilerOptions: {
+        target: "ES2022",
+        module: "preserve",
+        moduleResolution: "bundler",
+        strict: true,
+        skipLibCheck: true,
+        noEmit: true,
+        allowImportingTsExtensions: true,
+      },
+      files: ["legacy.ts"],
+    }),
+  );
+  await exec(process.execPath, [
+    resolve("node_modules/typescript/lib/tsc.js"),
+    "-p",
+    join(legacyRoot, "tsconfig.json"),
+  ]).catch((error) => {
+    throw new Error(`Legacy consumer compilation failed:\n${error.stdout ?? ""}${error.stderr ?? ""}`, {
+      cause: error,
+    });
+  });
+  legacyCompiled = true;
+  await build({
+    entryPoints: [join(legacyRoot, "legacy.ts")],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    write: false,
+    plugins: [
+      {
+        name: "external-host-packages",
+        setup(builder) {
+          builder.onResolve({ filter: /^[^./]/ }, ({ path }) =>
+            path.startsWith("@narumitw/pi-plan-mode/") ? undefined : { path, external: true },
+          );
+        },
+      },
+    ],
+  });
+  legacyBundled = true;
+  await writeFile(
+    join(legacyRoot, "legacy-extension.ts"),
+    `${legacyImports}
+export default function (pi) {
+  if (!commands.every(Boolean) || !entries.every((entry) => typeof entry === "function")) throw new Error("Invalid legacy imports");
+  pi.registerCommand("legacy-compat", { description: "Packed legacy compatibility probe", handler: async () => {} });
+}
+`,
+  );
+  await writeFile(
+    join(legacyRoot, "consumer.mjs"),
+    `
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+process.send?.("ready");
+await new Promise((done) => process.once("message", done));
+process.disconnect?.();
+const require = createRequire(import.meta.url);
+assert.equal(require.resolve("@narumitw/pi-plan-mode/package"), require.resolve("@narumitw/pi-plan-mode/package.json"));
+for (const [path, target] of [["src", "src/index.ts"], ["src/index", "src/index.ts"], ["src/tool-policy", "src/tool-policy.ts"], ["src/tool-policy.ts", "src/tool-policy.ts"], ["dist", "dist/index.ts"], ["dist/index", "dist/index.ts"], ["dist/index.ts", "dist/index.ts"], ["dist/durable", "dist/durable.js"], ["dist/durable.js", "dist/durable.js"], ["dist/durable.d.ts", "dist/durable.d.ts"], ["dist/durable.js.map", "dist/durable.js.map"], ["dist/index.ts.map", "dist/index.ts.map"]]) {
+  assert.ok(import.meta.resolve("@narumitw/pi-plan-mode/" + path).endsWith("/" + target), path);
+}
+for (const path of ${JSON.stringify(packedFiles)}) {
+  assert.ok(import.meta.resolve("@narumitw/pi-plan-mode/" + path).endsWith("/" + path), path);
+  if ((path.startsWith("src/") || path.startsWith("dist/")) && path.endsWith(".ts") && !path.endsWith(".d.ts")) {
+    assert.ok(import.meta.resolve("@narumitw/pi-plan-mode/" + path.slice(0, -3)).endsWith("/" + path), path);
+  }
+}
+await mkdir(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+const loader = new DefaultResourceLoader({ cwd: process.cwd(), agentDir: process.env.PI_CODING_AGENT_DIR,
+  settingsManager: SettingsManager.inMemory({}), additionalExtensionPaths: [join(process.cwd(), "legacy-extension.ts")] });
+await loader.reload();
+const loaded = loader.getExtensions();
+assert.deepEqual(loaded.errors, []);
+assert.equal(loaded.extensions.length, 1);
+assert.ok(loaded.extensions[0].commands.has("legacy-compat"));
+console.log("packed legacy consumers passed");
+`,
+  );
+  await prepareChild(legacyRoot, join(legacyRoot, "consumer.mjs"), []);
 }, 30_000);
 
 afterAll(async () => {
@@ -250,6 +357,19 @@ test("packed metadata preserves one Jiti entry, old file paths, and optional exa
 
 test("packed public declarations compile with the real pinned host and legacy source subpaths", () => {
   expect(consumerCompiled).toBe(true);
+});
+
+test("packed TypeScript and esbuild consumers preserve extensionless and explicit source imports", () => {
+  expect(legacyCompiled).toBe(true);
+  expect(legacyBundled).toBe(true);
+});
+
+test("packed Jiti consumer preserves extensionless entries and metadata aliases", async () => {
+  const consumer = consumers[2];
+  consumer.child.send("run");
+  const result = await consumer.completed;
+  expect(result.code, result.stderr).toBe(0);
+  expect(result.stdout).toContain("packed legacy consumers passed");
 });
 
 test("packed ESM durable entry runs with real hosts and no coding-agent graph", async () => {

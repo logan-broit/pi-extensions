@@ -9,6 +9,20 @@
       "types": "./dist/durable.d.ts",
       "import": "./dist/durable.js"
     },
+    "./package": "./package.json",
+    "./src": "./src/index.ts",
+    "./src/*.ts": "./src/*.ts",
+    "./src/*.js": "./src/*.js",
+    "./src/*": "./src/*.ts",
+    "./dist": "./dist/index.ts",
+    "./dist/*.ts": "./dist/*.ts",
+    "./dist/*.js": "./dist/*.js",
+    "./dist/*.map": "./dist/*.map",
+    "./dist/durable": "./dist/durable.js",
+    "./dist/*": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.ts"
+    },
     "./*": "./*"
   },
   "private": false,
