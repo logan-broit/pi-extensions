@@ -236,6 +236,11 @@ export function createDurablePolicy(
     await harness.commit((tx) => check(tx, api, name, args, memo), context);
     assertRegistry();
   };
+  const admissionHook = hook(ToolTask, {
+    beforeTool: async (call, api, context) => {
+      await admit(call.name, call.arguments, api, context);
+    },
+  });
   const guards = new WeakMap<ToolRegistration, ToolRegistration>();
   const guard = (tool: ToolRegistration): ToolRegistration => {
     const previous = guards.get(tool);
@@ -296,6 +301,21 @@ export function createDurablePolicy(
       if (transformed) return transformed;
       const extensions = raw.installed().map((extension) => ({
         ...extension,
+        // A selected tool owner must admit fresh calls even when the Plan extension is deselected.
+        // Recovery skips beforeTool, so missing or stale task authorization still fails closed.
+        ...(extension.tools?.length && !extension.hooks?.includes(admissionHook)
+          ? {
+              hooks: [
+                ...(extension.hooks ?? []),
+                hook(ToolTask, {
+                  beforeTool: async (call, api, context) => {
+                    if (extension.tools?.some((tool) => tool.name === call.name))
+                      await admit(call.name, call.arguments, api, context);
+                  },
+                }),
+              ],
+            }
+          : {}),
         ...(extension.tools === undefined ? {} : { tools: extension.tools.map(guard) }),
         ...(extension.wraps === undefined
           ? {}
@@ -329,11 +349,7 @@ export function createDurablePolicy(
   };
   return {
     reader,
-    hook: hook(ToolTask, {
-      beforeTool: async (call, api, context) => {
-        await admit(call.name, call.arguments, api, context);
-      },
-    }),
+    hook: admissionHook,
     section: section(
       "plan_mode",
       async (input, context) => {
