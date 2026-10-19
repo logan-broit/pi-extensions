@@ -95,6 +95,8 @@ export function fingerprint(value: unknown): string {
       return Object.fromEntries(
         Object.keys(input)
           .sort()
+          // Optional object fields have the same identity as omitted fields, unlike array elements.
+          .filter((key) => (input as Record<string, unknown>)[key] !== undefined)
           .map((key) => [key, sorted((input as Record<string, unknown>)[key])]),
       );
     if (input === undefined) throw new Error("Operation payload must be JSON");

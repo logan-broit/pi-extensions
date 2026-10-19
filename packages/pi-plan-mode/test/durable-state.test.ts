@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
 import {
@@ -133,6 +134,52 @@ describe("durable workflow transitions", () => {
       applyHostMutation(state, 1, "approve", { ...input, expected: { ...input.expected, revision: 999 } }, options),
     ).toThrow(/different payload/);
   });
+  it("start without a prompt accepts undefined and retries with an omitted prompt", () => {
+    const state = initialState(1);
+    const input = { operationId: "start", expected: identity(state), workflowId: "workflow" };
+    const first = applyHostMutation(state, 1, "start", { ...input, prompt: undefined }, options);
+    const before = structuredClone(state);
+    expect(first.receipt.status).toBe("done");
+    expect(state.delivery).toBeUndefined();
+    expect(applyHostMutation(state, 1, "start", input, options)).toEqual({
+      receipt: first.receipt,
+      duplicate: true,
+    });
+    expect(() => applyHostMutation(state, 1, "start", { ...input, prompt: "changed" }, options)).toThrow(
+      /different payload/,
+    );
+    expect(state).toEqual(before);
+  });
+  it.each([true, false])("answers omit undefined optionals and replay exactly (custom=%s)", (wasCustom) => {
+    const state = planning();
+    recordHelper(state, 1, 11, "question", { questions: [question] }, authorization(state), options.registryVersion);
+    const answer = {
+      id: question.id,
+      header: question.header,
+      question: question.question,
+      answer: wasCustom ? "  custom answer\n" : "First",
+      wasCustom,
+      ...(wasCustom ? {} : { optionIndex: 1 }),
+    };
+    const input = { ...mutation(state), batchId: 11, answers: [answer] };
+    const first = applyHostMutation(
+      state,
+      1,
+      "answer",
+      { ...input, answers: [{ ...answer, optionIndex: answer.optionIndex, note: undefined }] },
+      options,
+    );
+    const before = structuredClone(state);
+    expect(JSON.parse(required(required(state.delivery).content)).answers).toEqual([answer]);
+    expect(applyHostMutation(state, 1, "answer", input, options)).toEqual({
+      receipt: first.receipt,
+      duplicate: true,
+    });
+    expect(() =>
+      applyHostMutation(state, 1, "answer", { ...input, answers: [{ ...answer, note: "changed" }] }, options),
+    ).toThrow(/different payload/);
+    expect(state).toEqual(before);
+  });
   it("concurrent approval and revision cannot both use the same ready revision", () => {
     const state = ready();
     const expected = identity(state);
@@ -252,5 +299,44 @@ describe("durable validation and helper replay", () => {
   });
   it("fingerprints are structural rather than object key order dependent", () => {
     expect(fingerprint({ a: 1, b: { c: 2, d: 3 } })).toBe(fingerprint({ b: { d: 3, c: 2 }, a: 1 }));
+  });
+  it.each([
+    [{ optional: undefined }, {}],
+    [{ a: 1, optional: undefined }, { a: 1 }],
+    [
+      { b: { optional: undefined, c: 2 }, a: 1 },
+      { a: 1, b: { c: 2 } },
+    ],
+    [
+      [{ optional: undefined, note: "" }, { nested: { optional: undefined } }],
+      [{ note: "" }, { nested: {} }],
+    ],
+  ])("fingerprints omit undefined object properties: %j", (input, omitted) => {
+    const before = structuredClone(input);
+    expect(fingerprint(input)).toBe(fingerprint(omitted));
+    expect(input).toEqual(before);
+  });
+  it.each([
+    { label: "root", input: undefined },
+    { label: "array element", input: [undefined] },
+    { label: "later array element", input: [1, undefined] },
+    { label: "object's array element", input: { nested: [undefined] } },
+    { label: "nested array element", input: [{ nested: [undefined] }] },
+  ])("fingerprints reject undefined at $label", ({ input }) => {
+    expect(() => fingerprint(input)).toThrow("Operation payload must be JSON");
+  });
+  it.each<[unknown, string]>([
+    [null, "null"],
+    [true, "true"],
+    [false, "false"],
+    [0, "0"],
+    [-0, "0"],
+    [1.25, "1.25"],
+    ["  exact\n界", '"  exact\\n界"'],
+    [[], "[]"],
+    [[null, false, 2, { b: 1, a: 0 }], '[null,false,2,{"a":0,"b":1}]'],
+    [{ z: { b: 2, a: 1 }, a: [], "10": "ten", "2": "two" }, '{"2":"two","10":"ten","a":[],"z":{"a":1,"b":2}}'],
+  ])("preserves existing valid JSON fingerprints: %j", (input, canonical) => {
+    expect(fingerprint(input)).toBe(createHash("sha256").update(canonical).digest("hex"));
   });
 });
