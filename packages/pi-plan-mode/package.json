@@ -4,6 +4,13 @@
   "description": "Pi extension that adds a Codex-like read-only /plan collaboration mode.",
   "type": "module",
   "license": "MIT",
+  "exports": {
+    "./durable": {
+      "types": "./dist/durable.d.ts",
+      "import": "./dist/durable.js"
+    },
+    "./*": "./*"
+  },
   "private": false,
   "keywords": [
     "pi-package",
@@ -32,11 +39,23 @@
     "prepack": "npm run build"
   },
   "peerDependencies": {
+    "@earendil-works/chord": "^1.2.0",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-durable": "1.2.0",
     "@earendil-works/pi-tui": "*"
   },
+  "peerDependenciesMeta": {
+    "@earendil-works/chord": {
+      "optional": true
+    },
+    "@earendil-works/pi-durable": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@earendil-works/chord": "1.2.0",
     "@earendil-works/pi-coding-agent": "1.2.0",
+    "@earendil-works/pi-durable": "1.2.0",
     "@earendil-works/pi-tui": "1.2.0",
     "esbuild": "0.28.2",
     "typescript": "7.0.2"
