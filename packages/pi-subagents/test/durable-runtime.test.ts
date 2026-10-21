@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { awaitWithContext, type Context } from "@earendil-works/chord/context";
 import { build } from "esbuild";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { type DurableProfile, type DurableRuntimeOptions, DurableSubagentRuntime } from "../src/durable-runtime.js";
 import type { DurableState } from "../src/durable-state.js";
 import { runtimeModels } from "./durable-runtime-worker.js";
@@ -593,19 +593,29 @@ async function worker(root: string, ...blocks: string[]) {
 }
 
 describe.skipIf(process.platform !== "linux")("production durable runtime cold-process recovery", () => {
-  it.each(["admitted", "submitted", "settled"])(
-    "recovers SIGKILL at %s without duplicate admissions or reports",
-    async (stage) => {
-      const root = await directory();
+  // Arrange the real crash and cold reopen in separate hooks. Only ready-worker
+  // commands and recovery assertions use the unchanged five-second test budget.
+  // The shared afterEach cleanup also reaps workers when either setup hook fails.
+  describe.each(["admitted", "submitted", "settled"])("SIGKILL at %s", (stage) => {
+    let root: string;
+    let conversationId: string;
+    let inode: number;
+    let second: Worker;
+    beforeEach(async () => {
+      root = await directory();
       const first = await worker(root, stage);
       const spawn = first.request<{ conversationId: string; requestId: string }>("spawn").catch(() => undefined);
       await first.event(stage);
       const snapshot = await first.request<DurableState>("state");
-      const conversationId = String(snapshot.requests["tool-spawn"]?.conversationId);
-      const inode = (await lstat(join(root, "owner.lock"))).ino;
+      conversationId = String(snapshot.requests["tool-spawn"]?.conversationId);
+      inode = (await lstat(join(root, "owner.lock"))).ino;
       await first.kill();
       await spawn;
-      const second = await worker(root);
+    });
+    beforeEach(async () => {
+      second = await worker(root);
+    });
+    it("recovers without duplicate admissions or reports", async () => {
       expect((await lstat(join(root, "owner.lock"))).ino).toBe(inode);
       expect(await second.request("spawn")).toEqual({ conversationId, requestId: "tool-spawn" });
       const result = await second.request("wait", { conversationId });
@@ -614,61 +624,78 @@ describe.skipIf(process.platform !== "linux")("production durable runtime cold-p
       expect(Object.keys(state.agents)).toEqual([conversationId]);
       expect(Object.keys(state.requests)).toEqual(["tool-spawn"]);
       expect(Object.values(state.reports)).toHaveLength(1);
-    },
-  );
+    });
+  });
 
-  it.each(["before-stop", "stop-intent"])(
-    "recovers accepted stop at %s before generation can restart",
-    async (stage) => {
-      const root = await directory();
+  describe.each(["before-stop", "stop-intent"])("accepted stop at %s", (stage) => {
+    let root: string;
+    let conversationId: string;
+    let second: Worker;
+    beforeEach(async () => {
+      root = await directory();
       const first = await worker(root, "generation:A", stage);
-      const agent = await first.request<{ conversationId: string }>("spawn");
+      ({ conversationId } = await first.request<{ conversationId: string }>("spawn"));
       await first.event("generation:A");
-      const stop = first.request("stop", { conversationId: agent.conversationId }).catch(() => undefined);
+      const stop = first.request("stop", { conversationId }).catch(() => undefined);
       await first.event(stage);
       await first.kill();
       await stop;
-      const second = await worker(root, "generation:A", "generation:B");
-      expect(await second.request("wait", { conversationId: agent.conversationId })).toMatchObject({
+    });
+    beforeEach(async () => {
+      second = await worker(root, "generation:A", "generation:B");
+    });
+    it("recovers before generation can restart", async () => {
+      expect(await second.request("wait", { conversationId })).toMatchObject({
         timedOut: false,
         outcome: "cancelled",
         state: "idle",
       });
       expect(await second.request("model-calls")).toBe(0);
-      await second.request("send", { conversationId: agent.conversationId, requestId: "new", task: "B" });
+      await second.request("send", { conversationId, requestId: "new", task: "B" });
       await second.event("generation:B");
-      await second.request("stop", { conversationId: agent.conversationId });
+      await second.request("stop", { conversationId });
       expect((await second.request<DurableState>("state")).requests.new).toMatchObject({
         outcome: null,
         cancelOutcome: null,
       });
       await second.request("release", { checkpoint: "generation:B" });
-      expect(await second.request("wait", { conversationId: agent.conversationId })).toMatchObject({
+      expect(await second.request("wait", { conversationId })).toMatchObject({
         outcome: "completed",
         result: "answer:B",
       });
-    },
-  );
-
-  it("honors a persisted expired deadline before scheduling recovered model work", async () => {
-    const root = await directory();
-    const first = await worker(root, "submitted", "generation:A");
-    const agent = await first.request<{ conversationId: string }>("spawn", { timeoutMs: 1000 });
-    // A real backend waiter times out while submit is blocked. No polling or test sleep.
-    await first.event("submitted");
-    const before = await first.request<DurableState>("state");
-    expect(before.requests["tool-spawn"]?.deadline).not.toBeNull();
-    expect(await first.request("wait", { conversationId: agent.conversationId })).toMatchObject({ timedOut: true });
-    expect(before.requests["tool-spawn"]?.deadline).toBeLessThanOrEqual(Date.now());
-    await first.kill();
-    const second = await worker(root, "generation:A");
-    expect(await second.request("wait", { conversationId: agent.conversationId })).toMatchObject({
-      timedOut: false,
-      outcome: "timed_out",
-      state: "idle",
     });
-    expect(await second.request("model-calls")).toBe(0);
-    const state = await second.request<DurableState>("state");
-    expect(state.requests["tool-spawn"]?.deadline).toBe(before.requests["tool-spawn"]?.deadline);
+  });
+
+  describe("expired deadline recovery", () => {
+    let root: string;
+    let conversationId: string;
+    let deadline: number | null | undefined;
+    let second: Worker;
+    beforeEach(async () => {
+      root = await directory();
+      const first = await worker(root, "submitted", "generation:A");
+      ({ conversationId } = await first.request<{ conversationId: string }>("spawn", { timeoutMs: 1000 }));
+      // A real backend waiter times out while submit is blocked. No polling or test sleep.
+      await first.event("submitted");
+      const before = await first.request<DurableState>("state");
+      deadline = before.requests["tool-spawn"]?.deadline;
+      expect(deadline).not.toBeNull();
+      expect(await first.request("wait", { conversationId })).toMatchObject({ timedOut: true });
+      expect(deadline).toBeLessThanOrEqual(Date.now());
+      await first.kill();
+    });
+    beforeEach(async () => {
+      second = await worker(root, "generation:A");
+    });
+    it("honors a persisted expired deadline before scheduling recovered model work", async () => {
+      expect(await second.request("wait", { conversationId })).toMatchObject({
+        timedOut: false,
+        outcome: "timed_out",
+        state: "idle",
+      });
+      expect(await second.request("model-calls")).toBe(0);
+      const state = await second.request<DurableState>("state");
+      expect(state.requests["tool-spawn"]?.deadline).toBe(deadline);
+    });
   });
 });
