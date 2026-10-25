@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/@narumitw/pi-langfuse)](https://www.npmjs.com/package/@narumitw/pi-langfuse) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
-Export Pi coding-agent and durable conversation activity to [Langfuse](https://langfuse.com/) through OpenTelemetry.
+Export Pi coding-agent and durable conversation activity to [Langfuse](https://langfuse.com/) through standard OpenTelemetry and OTLP over HTTP, without the Langfuse SDK.
 
 ## ✨ Features
 
@@ -36,9 +36,9 @@ pi -e ./packages/pi-langfuse
 ```
 
 The package declares `dist/index.ts`, so Pi cannot load an unbuilt local checkout.
-The Langfuse SDK requires Node.js >=22; the supported Pi runtimes require Node.js >=22.19.0.
-[Langfuse SDK 6](https://langfuse.com/docs/observability/sdk/upgrade-path/js-v5-to-v6) requires Langfuse Cloud or self-hosted Langfuse >=4.59.0.
-Proxies must accept gzip-compressed trace requests, or you must set `LANGFUSE_OTEL_COMPRESSION=none` before starting Pi.
+The tracing runtime requires Node.js >=22.15.0; the supported Pi hosts require Node.js >=22.19.0.
+Use Langfuse Cloud or a self-hosted deployment that supports [OTLP ingestion version 4](https://langfuse.com/integrations/native/opentelemetry#real-time-ingestion).
+Requests use gzip by default. Set `LANGFUSE_OTEL_COMPRESSION=none` before starting Pi if a proxy requires uncompressed requests; see [transport settings and compatibility](./docs/otel-compatibility.md#transport-and-environment).
 The durable adapter targets experimental Pi durable APIs within the peer ranges in [`package.json`](./package.json); review its [compatibility and upgrade checks](./docs/durable.md#compatibility) before enabling or upgrading it.
 Pi extensions run with your user permissions.
 Review this extension and its data-export behavior before installing it.
@@ -109,8 +109,9 @@ Restart the process before switching from a package version that uses an older r
 
 Host runtime fields resolve independently in this order: `config`, the supplied `env` object (or `process.env`), then defaults.
 The supported names are `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`, `LANGFUSE_TRACING_ENVIRONMENT`, and `LANGFUSE_RELEASE`.
-Pass `env: false` to disable environment access.
-The default extension always uses its validated `pi-langfuse.json` with `env: false`, so its existing settings behavior does not change.
+Pass `env: false` to disable environment access for connection settings and transport options.
+The default extension resolves connection fields only from its validated `pi-langfuse.json`. It retains the documented compression and export-size environment controls, but environment variables cannot override its destination or credentials.
+See [transport and environment](./docs/otel-compatibility.md#transport-and-environment) for the separate compression and size controls available to embedded hosts.
 
 `setRequestId()` snapshots `pi.request.id` when the next root trace starts; changing or clearing it never rewrites an active trace.
 `traceName` changes only the Langfuse trace name; schema-v2 observation names and hierarchy stay unchanged.
@@ -294,7 +295,7 @@ Manual compaction outside an active agent trace is ignored; incomplete compactio
 Images and embedded base64 data URIs are represented without their payloads, including provider data URLs.
 Opaque `thinkingSignature`, `textSignature`, and `thoughtSignature` continuity values are always removed.
 Every captured input or output has one cumulative 64 KiB serialized UTF-8 budget, bounded object/array traversal, and deterministic truncation markers.
-Langfuse credentials are masked again in the span processor before network export.
+The production adapter masks Langfuse credentials and redacts embedded data URIs before it writes span attributes.
 
 The root agent begins before the first agent loop and remains open across retries, overflow-compaction recovery, and queued continuations.
 `agent_end` closes only the current attempt; `agent_settled` closes the root after no automatic work remains.
@@ -308,7 +309,8 @@ Missing Git, non-repositories, timeouts, and lookup failures silently omit Git c
 
 Completed observations are exported in batches while Pi remains live.
 Neither `agent_end` nor `agent_settled` waits for Langfuse network I/O.
-To wait for completed exports, run `/langfuse` and choose **Flush completed traces for this session**; quit shutdown also drains the provider.
+To wait for the exporter's flush operation, run `/langfuse` and choose **Flush completed traces for this session**; quit shutdown also drains the provider.
+Flush completion is not a Langfuse ingestion or storage acknowledgement; failed exports can lose traces.
 
 ## 💬 Commands
 
@@ -335,6 +337,16 @@ The built-in mask specifically protects Langfuse credentials; it is not a genera
 Set `"captureContent": false` in `pi-langfuse.json` when prompts, provider-request snapshots, responses, and tool content must remain local.
 Compaction summaries, tool partial results, opaque continuation signatures, authorization headers, cookies, and unapproved response headers are never exported in either mode.
 
+## 🚧 Limitations
+
+Langfuse is the supported destination; there is no generic OTLP endpoint setting.
+The adapter exports Pi-owned observations only and does not provide Langfuse prompt management, scores, media uploads, SDK baggage propagation, or third-party instrumentation discovery.
+These are outside this package's tracing API; images and embedded base64 data remain redacted, not uploaded.
+
+The OpenTelemetry migration keeps the public runtime, host-session, and experimental Durable APIs and schema-v2 hierarchy.
+See [OTLP compatibility](./docs/otel-compatibility.md) for attribute encoding, environment controls, delivery limits, and the service-validation boundary.
+Local collector tests do not establish acceptance by a deployed Langfuse service; confirm ingestion and UI behavior on your deployment before production rollout.
+
 ## 🗂️ Package layout
 
 ```text
@@ -345,9 +357,9 @@ packages/pi-langfuse/
 │   ├── pi-session.ts                  # Per-session Pi lifecycle controller
 │   ├── durable.ts                     # Public durable observer entrypoint
 │   ├── runtime-core.ts                # Process-runtime ownership
-│   ├── runtime.ts                     # Lazy production Langfuse runtime
+│   ├── runtime.ts                     # Lazy production OpenTelemetry runtime
 │   └── tracing.ts                     # Schema-v2 observation recorder
-├── docs/durable.md                    # Durable API, compatibility and privacy contract
+├── docs/                              # Durable API and OTLP compatibility guides
 ├── dist/                              # Generated Node, declaration, and Jiti runtime
 ├── scripts/build-runtime.mjs          # Runtime builder
 └── test/                              # Behavior and lifecycle coverage

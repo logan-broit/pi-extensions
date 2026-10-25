@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { getLangfuseTracerProvider, setLangfuseTracerProvider } from "@langfuse/tracing";
 import { afterAll, beforeAll, test } from "vitest";
 import { listFiles } from "../../../test/runtime-builder-contract.js";
 import { createMockContext } from "../../../test/support.js";
@@ -258,6 +257,22 @@ test("runtime builds are deterministic, mapped, external, and remove stale outpu
     assert.deepEqual(await snapshotDirectory(first), await snapshotDirectory(second));
     assert.equal((await listFiles(second)).includes("chunks/stale.ts"), false);
     const files = await listFiles(first);
+    const { eagerInputs, eagerOutputs } = builder.validateEagerGraph(firstMetadata);
+    for (const input of eagerInputs) {
+      assert.doesNotMatch(input, /\/src\/(?:runtime|otel-observation|otel-exporter)\.ts$/u);
+    }
+    for (const outputPath of eagerOutputs) {
+      for (const imported of firstMetadata.outputs?.[outputPath]?.imports ?? []) {
+        if (imported.kind !== "dynamic-import") assert.doesNotMatch(imported.path, /@opentelemetry\//u);
+      }
+    }
+    for (const path of files.filter((path) => /\.(?:js|ts)$/u.test(path))) {
+      const source = await readFile(join(first, path), "utf8");
+      assert.doesNotMatch(source, /@langfuse\/(?:otel|tracing)|@opentelemetry\/sdk-trace-(?:base|node)/u, path);
+    }
+    for (const publicDeclaration of ["index.d.ts", "durable.d.ts"]) {
+      assert.doesNotMatch(await readFile(join(first, publicDeclaration), "utf8"), /@opentelemetry\//u);
+    }
     assert.ok(files.includes("index.js"));
     assert.ok(files.includes("index.js.map"));
     assert.ok(files.includes("index.ts"));
@@ -298,7 +313,7 @@ test("generated JavaScript root exposes the host API without eagerly loading pro
     const output = join(root, "dist");
     await cp(requireBuildFixture().output, output, { recursive: true });
     const entrySource = await readFile(join(output, "index.js"), "utf8");
-    assert.doesNotMatch(entrySource, /@langfuse\/otel/u);
+    assert.doesNotMatch(entrySource, /@opentelemetry\/|@langfuse\//u);
 
     const module = await import(`${pathToFileURL(join(output, "index.js")).href}?test=${crypto.randomUUID()}`);
     assert.equal(typeof module.default, "function");
@@ -307,6 +322,36 @@ test("generated JavaScript root exposes the host API without eagerly loading pro
     await assert.rejects(module.createLangfuseRuntime({ env: false }), /publicKey is required/u);
     assert.match(await readFile(join(output, "index.d.ts"), "utf8"), /createPiLangfuseSession/u);
   } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("generated host APIs defer production SDK execution until runtime creation", async () => {
+  const root = await mkdtemp(join(packageRoot, ".pi-langfuse-build-test-"));
+  let tracing: { dispose(): Promise<void> } | undefined;
+  try {
+    const output = join(root, "dist");
+    await cp(requireBuildFixture().output, output, { recursive: true });
+    const productionModules: string[] = [];
+    for (const path of (await listFiles(output)).filter((path) => path.endsWith(".js"))) {
+      const source = await readFile(join(output, path), "utf8");
+      if (source.includes('"@opentelemetry/sdk-trace"')) {
+        productionModules.push(path);
+        await writeFile(join(output, path), 'throw new Error("production SDK loaded lazily");\n');
+      }
+    }
+    assert.ok(productionModules.length > 0, "the generated graph must contain the real standard OTel SDK boundary");
+    const module = await import(pathToFileURL(join(output, "index.js")).href);
+    const controller = module.createPiLangfuseSession({
+      closed: false,
+      flush: async () => undefined,
+      shutdown: async () => undefined,
+    });
+    tracing = controller;
+    assert.equal(typeof controller.extension, "function");
+    await assert.rejects(module.createLangfuseRuntime({ env: false }), /production SDK loaded lazily/u);
+  } finally {
+    await tracing?.dispose();
     await rm(root, { force: true, recursive: true });
   }
 });
@@ -364,7 +409,6 @@ test("generated package copies share runtime session capabilities", async () => 
     const key = Symbol.for(`@narumitw/pi-langfuse/runtime/${version}`);
     return { key, descriptor: Object.getOwnPropertyDescriptor(globalThis, key) };
   });
-  const previousProvider = getLangfuseTracerProvider();
   const root = await mkdtemp(join(packageRoot, ".pi-langfuse-build-test-"));
   try {
     // Own a fresh runtime without closing any runtime inherited from another test.
@@ -414,11 +458,7 @@ test("generated package copies share runtime session capabilities", async () => 
             else Reflect.deleteProperty(globalThis, key);
           }
         } finally {
-          try {
-            setLangfuseTracerProvider(previousProvider);
-          } finally {
-            await rm(root, { force: true, recursive: true });
-          }
+          await rm(root, { force: true, recursive: true });
         }
       }
     }

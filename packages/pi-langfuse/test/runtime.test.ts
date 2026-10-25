@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
-import { context as otelContext, trace } from "@opentelemetry/api";
-import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
-import { test } from "vitest";
+import { context as otelContext, ROOT_CONTEXT, trace } from "@opentelemetry/api";
+import {
+  InMemorySpanExporter,
+  SimpleSpanProcessor,
+  StackContextManager,
+  TracerProvider,
+} from "@opentelemetry/sdk-trace";
+import { afterEach, beforeEach, onTestFinished, test, vi } from "vitest";
 import {
   createLangfuseRuntime,
   createProductionBackend,
@@ -12,6 +16,23 @@ import {
 import { createLangfuseRuntimeFromBackend } from "../src/runtime-core.js";
 import { TraceRecorder } from "../src/tracing.js";
 import { FakeBackend } from "./support.js";
+
+const runtimeKeys = ["v1", "v2"].map((version) => Symbol.for(`@narumitw/pi-langfuse/runtime/${version}`));
+let runtimeSlots: (PropertyDescriptor | undefined)[];
+
+beforeEach(() => {
+  runtimeSlots = runtimeKeys.map((key) => Object.getOwnPropertyDescriptor(globalThis, key));
+  for (const key of runtimeKeys) Reflect.deleteProperty(globalThis, key);
+});
+
+afterEach(() => {
+  for (const [index, key] of runtimeKeys.entries()) {
+    const descriptor = runtimeSlots[index];
+    if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+    else Reflect.deleteProperty(globalThis, key);
+  }
+  vi.restoreAllMocks();
+});
 
 test("maskSecrets redacts Langfuse credentials in nested exported data", () => {
   assert.deepEqual(maskSecrets({ text: "keys sk-lf-secret and pk-lf-public" }, ["custom-secret"]), {
@@ -85,8 +106,8 @@ test("v2 runtime reserves the legacy slot against reverse-order provider initial
   const runtimeKey = Symbol.for("@narumitw/pi-langfuse/runtime/v2");
   const legacyKey = Symbol.for("@narumitw/pi-langfuse/runtime/v1");
   const globals = globalThis as typeof globalThis & { [key: symbol]: unknown };
-  const processor = new SimpleSpanProcessor(new InMemorySpanExporter());
-  const provider = new NodeTracerProvider({ spanProcessors: [processor] });
+  const processor = new SimpleSpanProcessor({ exporter: new InMemorySpanExporter() });
+  const provider = new TracerProvider({ spanProcessors: [processor] });
   const config = {
     publicKey: "pk-reverse-order",
     secretKey: "sk-reverse-order",
@@ -99,7 +120,6 @@ test("v2 runtime reserves the legacy slot against reverse-order provider initial
     backend = await createProductionBackend(config, {
       createProcessor: () => processor,
       createProvider: () => provider,
-      selectProvider: () => undefined,
     });
     const legacySlot = (await globals[legacyKey]) as { shutdown?: boolean };
 
@@ -126,7 +146,9 @@ test("runtime flush serialization recovers after failure and shutdown remains id
 
   await assert.rejects(runtime.flush(), /injected flush failure/);
   await runtime.flush();
-  await runtime.shutdown();
+  const shutdown = runtime.shutdown();
+  assert.equal(runtime.shutdown(), shutdown);
+  await Promise.all([shutdown, runtime.shutdown()]);
   await runtime.shutdown();
 
   assert.equal(backend.flushes, 3);
@@ -135,12 +157,119 @@ test("runtime flush serialization recovers after failure and shutdown remains id
   await assert.rejects(runtime.flush(), /closed|shutting down/i);
 });
 
-test("isolated runtime preserves the global provider and exports native observation hierarchy", async () => {
-  const existingGlobalProvider = new NodeTracerProvider();
+test.each([
+  { stage: "processor", cleanupFails: false },
+  { stage: "provider", cleanupFails: false },
+  { stage: "provider", cleanupFails: true },
+  { stage: "tracer", cleanupFails: false },
+  { stage: "tracer", cleanupFails: true },
+])(
+  "failed $stage initialization releases owned resources and permits retry (cleanup failure: $cleanupFails)",
+  async ({ stage, cleanupFails }) => {
+    const config = {
+      publicKey: "pk-init",
+      secretKey: "sk-init",
+      baseUrl: "https://example.test",
+      captureContent: false,
+    };
+    const exporter = new InMemorySpanExporter();
+    const processor = new SimpleSpanProcessor({ exporter });
+    const shutdownProcessor = processor.shutdown.bind(processor);
+    const processorShutdown = vi.spyOn(processor, "shutdown");
+    const exporterShutdown = vi.spyOn(exporter, "shutdown");
+    let providerShutdowns = 0;
+    let failedProvider: TracerProvider | undefined;
+    onTestFinished(async () => {
+      await failedProvider?.shutdown().catch(() => undefined);
+      await processor.shutdown().catch(() => undefined);
+    });
+
+    await assert.rejects(
+      createProductionBackend(config, {
+        createProcessor: () => {
+          if (stage === "processor") throw new Error("injected processor initialization failure");
+          return processor;
+        },
+        createProvider: (ownedProcessor) => {
+          if (stage === "provider") {
+            if (cleanupFails)
+              processorShutdown.mockImplementation(async () => {
+                await shutdownProcessor();
+                throw new Error("injected cleanup failure");
+              });
+            throw new Error("injected provider initialization failure");
+          }
+          const provider = new TracerProvider({ spanProcessors: [ownedProcessor] });
+          failedProvider = provider;
+          const shutdown = provider.shutdown.bind(provider);
+          provider.shutdown = async () => {
+            providerShutdowns += 1;
+            await shutdown();
+            if (cleanupFails) throw new Error("injected cleanup failure");
+          };
+          vi.spyOn(provider, "getTracer").mockImplementation(() => {
+            throw new Error("injected tracer initialization failure");
+          });
+          return provider;
+        },
+      }),
+      new RegExp(`injected ${stage} initialization failure`, "u"),
+    );
+    assert.equal(processorShutdown.mock.calls.length, stage === "processor" ? 0 : 1);
+    assert.equal(providerShutdowns, stage === "tracer" ? 1 : 0);
+    assert.equal(exporterShutdown.mock.calls.length, stage === "processor" ? 0 : 1);
+    for (const key of runtimeKeys) assert.equal(Reflect.has(globalThis, key), false);
+
+    const retryExporter = new InMemorySpanExporter();
+    let processors = 0;
+    let providers = 0;
+    const backend = await createProductionBackend(config, {
+      createProcessor: () => {
+        processors += 1;
+        return new SimpleSpanProcessor({ exporter: retryExporter });
+      },
+      createProvider: (ownedProcessor) => {
+        providers += 1;
+        return new TracerProvider({ spanProcessors: [ownedProcessor] });
+      },
+    });
+    const runtime = await createLangfuseRuntime({ config, env: false });
+    onTestFinished(() => runtime.shutdown());
+    const failIfReinitialized = () => {
+      throw new Error("shared runtime must reuse its provider");
+    };
+    assert.equal(
+      await createProductionBackend(config, {
+        createProcessor: failIfReinitialized,
+        createProvider: failIfReinitialized,
+      }),
+      backend,
+    );
+    assert.equal(processors, 1);
+    assert.equal(providers, 1);
+    backend.start("recovered", {}, { asType: "agent" }).end();
+    await runtime.flush();
+    assert.deepEqual(
+      retryExporter.getFinishedSpans().map((span) => span.name),
+      ["recovered"],
+    );
+  },
+);
+
+test("isolated runtime preserves the global provider and exports native observation hierarchy", async ({
+  onTestFinished,
+}) => {
+  const existingGlobalProvider = new TracerProvider();
+  onTestFinished(async () => {
+    otelContext.disable();
+    trace.disable();
+    await existingGlobalProvider.shutdown();
+  });
+  assert.equal(otelContext.setGlobalContextManager(new StackContextManager().enable()), true);
   assert.equal(trace.setGlobalTracerProvider(existingGlobalProvider), true);
   const globalProvider = trace.getTracerProvider();
   const exporter = new InMemorySpanExporter();
-  const processor = new SimpleSpanProcessor(exporter);
+  const processor = new SimpleSpanProcessor({ exporter });
   let providers = 0;
   const config = {
     publicKey: "pk-runtime-test",
@@ -148,22 +277,14 @@ test("isolated runtime preserves the global provider and exports native observat
     baseUrl: "https://example.test",
     captureContent: true,
   };
-  await assert.rejects(
-    createProductionBackend(config, {
-      createProcessor: () => new SimpleSpanProcessor(new InMemorySpanExporter()),
-      createProvider: () => {
-        throw new Error("provider initialization failed");
-      },
-    }),
-    /provider initialization failed/,
-  );
   const backend = await createProductionBackend(config, {
     createProcessor: () => processor,
     createProvider: (spanProcessor) => {
       providers += 1;
-      return new NodeTracerProvider({ spanProcessors: [spanProcessor] });
+      return new TracerProvider({ spanProcessors: [spanProcessor] });
     },
   });
+  onTestFinished(() => backend.shutdown());
   assert.equal(await createProductionBackend(config), backend);
   const [runtime, concurrentRuntime] = await Promise.all([
     createLangfuseRuntime({ config, env: false }),
@@ -192,7 +313,8 @@ test("isolated runtime preserves the global provider and exports native observat
     },
   });
   const ambient = trace.getTracer("ambient").startSpan("ambient");
-  otelContext.with(trace.setSpan(otelContext.active(), ambient), () => {
+  otelContext.with(trace.setSpan(ROOT_CONTEXT, ambient), () => {
+    assert.equal(trace.getSpan(otelContext.active()), ambient);
     recorder.beginAgent({ prompt: "hello" });
   });
   ambient.end();
@@ -342,4 +464,5 @@ test("isolated runtime preserves the global provider and exports native observat
   await runtime.shutdown();
   await runtime.shutdown();
   await existingGlobalProvider.shutdown();
+  trace.disable();
 });
