@@ -4,7 +4,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { test } from "vitest";
 import { settingsFilePath as caffeinateSettingsPath } from "../packages/pi-caffeinate/src/settings.js";
-import { langfuseConfigPath } from "../packages/pi-langfuse/src/config.js";
 
 const SETTINGS_PUBLICATION_SOURCES = [
   "packages/pi-accounts/src/account-store.ts",
@@ -36,7 +35,6 @@ test("settings paths use Pi tilde expansion", () => {
   try {
     const agentDir = join(homedir(), "pi-extension-settings-test");
     assert.equal(caffeinateSettingsPath(), join(agentDir, "pi-caffeinate.json"));
-    assert.equal(langfuseConfigPath(), join(agentDir, "pi-langfuse.json"));
   } finally {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;

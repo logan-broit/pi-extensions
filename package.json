@@ -28,7 +28,6 @@
       "./packages/pi-herdr/src/index.ts",
       "./packages/pi-inspect/src/index.ts",
       "./packages/pi-typesafe-search/src/index.ts",
-      "./packages/pi-langfuse/src/index.ts",
       "./packages/pi-lsp/src/index.ts",
       "./packages/pi-notes/src/index.ts",
       "./packages/pi-notify/src/index.ts",
