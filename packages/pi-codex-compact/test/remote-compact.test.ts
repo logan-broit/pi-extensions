@@ -9,7 +9,7 @@ import {
 import { describe, test } from "vitest";
 import type { ResponsesCompactionApi } from "../src/model-api.js";
 import { requestRemoteCompaction } from "../src/remote.js";
-import { responsesCompactUrl } from "../src/remote-compact.js";
+import { requestResponsesCompact, responsesCompactUrl } from "../src/remote-compact.js";
 
 const PROVIDER_MODULES = {
   "openai-responses": {
@@ -162,6 +162,64 @@ for (const api of Object.keys(PROVIDER_MODULES) as ResponsesCompactionApi[]) {
     });
   });
 }
+
+test("the real Responses adapter retains and replays the exact developer/user compact window", async () => {
+  const api = "openai-responses";
+  const provider = await providerFor(api);
+  const output = [
+    {
+      type: "message",
+      role: "developer",
+      status: "completed",
+      id: "msg_developer",
+      content: [{ type: "input_text", text: "retained instructions" }],
+    },
+    {
+      type: "message",
+      role: "user",
+      status: "completed",
+      id: "msg_user",
+      content: [{ type: "input_text", text: "retained user" }],
+    },
+    COMPACTION_ITEM,
+  ];
+  const request = {
+    provider,
+    model: modelFor(api),
+    protocol: "responses-compact" as const,
+    profile: "openai-responses-v1" as const,
+    apiKey: apiKey(api),
+    signal: new AbortController().signal,
+    maxRetries: 0,
+  };
+  const result = await requestRemoteCompaction({
+    ...request,
+    context: context(),
+    fetch: async (input) => {
+      assert.equal(String(input), PROVIDER_MODULES[api].compactUrl);
+      return compactResponse(output);
+    },
+  });
+  assert.deepEqual(result.compactedOutput, output);
+  assert.deepEqual(result.item, COMPACTION_ITEM);
+  assert.equal(result.usage.totalTokens, RAW_USAGE.total_tokens);
+
+  assert.ok(result.compactedOutput);
+  let replayedInput: unknown[] | undefined;
+  const repeated = await requestResponsesCompact({
+    ...request,
+    context: context("checkpoint marker"),
+    priorCheckpoint: { marker: "checkpoint marker", replacementHistory: result.compactedOutput },
+    fetch: async (_input, init) => {
+      replayedInput = JSON.parse(String(init?.body)).input;
+      return compactResponse(output);
+    },
+  });
+  assert.ok(replayedInput);
+  // Pi serializes the current system prompt first; the checkpoint window must follow unchanged.
+  assert.deepEqual(replayedInput.slice(1), output);
+  assert.deepEqual(repeated.compactedOutput, output);
+});
 
 test("a custom Codex profile keeps Codex unary fields when the route is forced", async () => {
   const model = {

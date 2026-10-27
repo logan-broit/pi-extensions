@@ -254,6 +254,35 @@ test("validates bounded unary compact output and response streaming", async () =
   assert.deepEqual(collected.output, validated.output);
 });
 
+for (const content of [
+  [{ type: "input_text", text: "retained instructions" }],
+  [{ type: "input_image", image_url: "https://example.test/image.png", detail: "auto" }],
+]) {
+  test(`preserves retained developer ${content[0].type} in the exact unary compact window`, () => {
+    // OpenAI ResponseInputMessageItem shares ResponseInputMessageContentList across these roles.
+    const value = {
+      output: [
+        { type: "message", role: "developer", status: "completed", id: "msg_developer", content },
+        {
+          type: "message",
+          role: "user",
+          status: "completed",
+          id: "msg_user",
+          content: [{ type: "input_text", text: "retained user" }],
+        },
+        { type: "compaction", id: "cmp_fixture", encrypted_content: "opaque" },
+      ],
+    };
+    const result = validateCompactedResponse(value);
+    assert.deepEqual(result.output, value.output);
+    assert.deepEqual(result.item, value.output[2]);
+    result.output[0].id = "mutated";
+    assert.equal(value.output[0].id, "msg_developer", "does not mutate the received window");
+    assert.throws(() => validateCompactedResponse(value, { maxBytes: 10 }), /response exceeded/);
+    assert.throws(() => validateCompactedResponse(value, { maxItemBytes: 10 }), /output item exceeded/);
+  });
+}
+
 test("rejects unsafe, malformed, oversized, and aborted unary compact responses", async () => {
   const item = { type: "compaction", encrypted_content: "opaque" };
   assert.throws(() => validateCompactedResponse({ output: [] }), /no output/);
@@ -274,6 +303,25 @@ test("rejects unsafe, malformed, oversized, and aborted unary compact responses"
     { role: "user", content: [{ type: "input_image", image_url: 42 }] },
     { role: "user", content: [{ type: "input_image", image_url: "image", detail: "huge" }] },
     { role: "user", content: [{ type: "input_file", file_data: "opaque" }] },
+    ...["system", "assistant", "tool", "unknown", undefined, null, 42].map((role) => ({
+      type: "message",
+      role,
+      content: [{ type: "input_text", text: "not a supported retained role" }],
+    })),
+    ...[
+      undefined,
+      "instructions",
+      [],
+      [null],
+      [{ type: "input_text" }],
+      [{ type: "input_text", text: 42 }],
+      [{ type: "output_text", text: "wrong direction" }],
+      [{ type: "input_image", detail: "auto" }],
+      [{ type: "input_image", image_url: 42 }],
+      [{ type: "input_image", image_url: "image", detail: "huge" }],
+      [{ type: "input_file", file_data: "opaque" }],
+    ].map((content) => ({ type: "message", role: "developer", content })),
+    { role: "developer", type: "not_message", content: [{ type: "input_text", text: "instructions" }] },
   ]) {
     assert.throws(() => validateCompactedResponse({ output: [retained, item] }), /unsupported retained/);
   }

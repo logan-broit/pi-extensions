@@ -197,7 +197,7 @@ function isRetainedCompactContent(value: unknown): value is JsonObject {
 function isRetainedCompactMessage(value: unknown): value is JsonObject {
   return (
     isObject(value) &&
-    value.role === "user" &&
+    (value.role === "user" || value.role === "developer") &&
     (value.type === undefined || value.type === "message") &&
     Array.isArray(value.content) &&
     value.content.length > 0 &&
