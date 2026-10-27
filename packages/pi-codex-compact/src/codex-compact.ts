@@ -302,6 +302,7 @@ async function compactRemotely(
           })
         : buildReplacementHistory(response.compactedOutput?.slice(0, -1) ?? response.promptInput, response.item, {
             tokenBudget: settings.replacementTokenBudget,
+            protocol: route.protocol,
           });
     const details = createCheckpointDetails({
       provider: model.provider,

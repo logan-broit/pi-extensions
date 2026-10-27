@@ -194,7 +194,7 @@ function isRetainedCompactContent(value: unknown): value is JsonObject {
   );
 }
 
-function isRetainedCompactMessage(value: unknown): value is JsonObject {
+export function isRetainedCompactMessage(value: unknown): value is JsonObject {
   return (
     isObject(value) &&
     (value.role === "user" || value.role === "developer") &&

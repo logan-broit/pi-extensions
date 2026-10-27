@@ -123,6 +123,79 @@ test("drops media that cannot fit the checkpoint byte budget", () => {
   assert.doesNotMatch(JSON.stringify(history), /input_image/);
 });
 
+test("selects retained roles by protocol without admitting malformed unary messages", () => {
+  const developer = {
+    type: "message",
+    role: "developer",
+    id: "msg_developer",
+    status: "completed",
+    content: [{ type: "input_text", text: "instructions" }],
+  };
+  const user = rawUser("history");
+  const lastDeveloper = { ...developer, id: "msg_developer_last" };
+  const candidates = [developer, user, lastDeveloper];
+  for (const options of [{}, { protocol: "remote-v2" as const }]) {
+    assert.deepEqual(buildReplacementHistory(candidates, opaque, options), [user, opaque]);
+  }
+  const unary = { protocol: "responses-compact" as const };
+  const history = buildReplacementHistory(candidates, opaque, unary);
+  assert.notEqual(history[0], developer);
+  assert.notEqual(history[0].content, developer.content);
+  assert.deepEqual(history, [...candidates, opaque]);
+  for (const invalid of [
+    null,
+    [],
+    { ...developer, role: "system" },
+    { ...developer, role: "assistant" },
+    { ...developer, type: "compaction_trigger" },
+    { ...developer, content: [] },
+    { ...developer, content: "invalid" },
+    { ...developer, content: [{ type: "input_text", text: 1 }] },
+    { ...developer, content: [{ type: "input_image", detail: "bad", file_id: "file" }] },
+    { ...developer, content: [{ type: "input_image" }] },
+    { ...developer, content: [{ type: "input_file", file_id: "file" }] },
+  ]) {
+    assert.deepEqual(buildReplacementHistory([invalid, user], opaque, unary), [user, opaque]);
+  }
+});
+
+for (const role of ["user", "developer"] as const) {
+  test(`unary ${role} retention keeps existing token, byte and media bounds`, () => {
+    const message = {
+      type: "message",
+      role,
+      id: "bounded",
+      status: "completed",
+      content: [{ type: "input_text", text: "abcdefghijklmnopqrstuvwxyz".repeat(4) }],
+    };
+    const unary = { protocol: "responses-compact" as const };
+    const tokenBounded = buildReplacementHistory([message], opaque, { ...unary, tokenBudget: 10 });
+    assert.equal(tokenBounded.length, 2);
+    assert.deepEqual(tokenBounded[0], {
+      ...message,
+      content: [{ type: "input_text", text: "[truncated]\ncdefghijklmnopqrstuvwxyz" }],
+    });
+    const byteBounded = buildReplacementHistory([message], opaque, { ...unary, byteBudget: 260 });
+    assert.ok(Buffer.byteLength(JSON.stringify(byteBounded)) <= 260);
+    assert.deepEqual(byteBounded.at(-1), opaque);
+    const media = { role, content: [{ type: "input_image", image_url: `data:image/png;base64,${"x".repeat(1024)}` }] };
+    assert.deepEqual(buildReplacementHistory([rawUser("small"), media], opaque, { ...unary, byteBudget: 512 }), [
+      rawUser("small"),
+      opaque,
+    ]);
+    const oversizedMedia = { role, content: [{ type: "input_image", image_url: "x".repeat(2 * 1024 * 1024) }] };
+    assert.deepEqual(buildReplacementHistory([oversizedMedia], opaque, unary), [opaque]);
+    assert.throws(
+      () => buildReplacementHistory([message], opaque, { ...unary, byteBudget: 1 }),
+      /exceeds replacement history budget/,
+    );
+    assert.deepEqual(buildReplacementHistory([message, rawUser("newest")], opaque, { ...unary, tokenBudget: 2 }), [
+      rawUser("newest"),
+      opaque,
+    ]);
+  });
+}
+
 test("validates versioned details and rejects malformed or unbounded persisted data", () => {
   const details = checkpoint();
   const customProvider = checkpoint([], "checkpoint-custom", "company-codex-proxy");
