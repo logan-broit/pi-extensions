@@ -164,7 +164,7 @@ If a request fails, the extension uses native fallback before the first checkpoi
 ## 🔒 Security and privacy
 
 Remote compaction sends conversation context and the system prompt to the configured Responses backend. Remote V2 and Context Management also send active tool schemas; Codex-profile unary requests retain provider-supported tools.
-The session stores the provider ID, encrypted checkpoint, and bounded retained user items or Context Management output. It does not store credentials or authorization/request headers in checkpoint details.
+The session stores the provider ID, encrypted checkpoint, and bounded retained messages: user items for Remote V2, user/developer items for unary compact, or Context Management output. It does not store credentials or authorization/request headers in checkpoint details.
 
 | Boundary | Limit |
 | --- | ---: |

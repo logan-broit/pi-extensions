@@ -4,7 +4,7 @@ import type { Api } from "@earendil-works/pi-ai";
 import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { validateContextManagementHistory } from "./context-management.js";
 import type { RemoteCompactionProtocol, ResponsesCompactionProfile } from "./model-api.js";
-import { type JsonObject, validateCompactionItem } from "./protocol.js";
+import { isRetainedCompactMessage, type JsonObject, validateCompactionItem } from "./protocol.js";
 
 export const CHECKPOINT_KIND = "pi-codex-remote-compaction";
 export const CHECKPOINT_VERSION = 3;
@@ -278,7 +278,11 @@ function truncateTextItem(item: JsonObject, maxChars: number): JsonObject | unde
 export function buildReplacementHistory(
   input: readonly unknown[],
   compactionItem: JsonObject,
-  options: { tokenBudget?: number; byteBudget?: number } = {},
+  options: {
+    tokenBudget?: number;
+    byteBudget?: number;
+    protocol?: "remote-v2" | "responses-compact";
+  } = {},
 ): JsonObject[] {
   const tokenBudget = options.tokenBudget ?? REPLACEMENT_TOKEN_BUDGET;
   const byteBudget = options.byteBudget ?? REPLACEMENT_BYTE_BUDGET;
@@ -287,8 +291,10 @@ export function buildReplacementHistory(
   let remainingChars = tokenBudget * 4;
   if (remainingBytes <= 0) throw new Error("Opaque compaction item exceeds replacement history budget");
   const retainedNewestFirst: JsonObject[] = [];
-  const candidates = input.filter(
-    (item): item is JsonObject => isObject(item) && item.role === "user" && item.type !== "compaction_trigger",
+  const candidates = input.filter((item): item is JsonObject =>
+    options.protocol === "responses-compact"
+      ? isRetainedCompactMessage(item)
+      : isObject(item) && item.role === "user" && item.type !== "compaction_trigger",
   );
   for (let index = candidates.length - 1; index >= 0; index--) {
     const candidate = candidates[index];
